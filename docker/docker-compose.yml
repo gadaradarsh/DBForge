@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------
+  # Service 1: The Target Database (PostgreSQL)
+  # ---------------------------------------------------------
+  postgres-db:
+    image: postgres:15-alpine
+    container_name: backupforge_postgres
+    restart: unless-stopped
+    
+    # Environment variables to configure the initial database credentials
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: securepassword
+      POSTGRES_DB: demo_db
+      
+    # Persistent volume to ensure data isn't lost if the container stops
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      
+    # Connect this service to our shared bridge network
+    networks:
+      - backup_network
+      
+    # Health checks ensure the database is actually ready to accept connections,
+    # not just that the container process has started.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d demo_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------
+  # Service 2: The Backup Framework
+  # ---------------------------------------------------------
+  backup-framework:
+    # Build the image using the Dockerfile in the current directory
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: backupforge_engine
+    
+    # Mount the local project directory into the container at /app.
+    # This allows us to write scripts on our host machine and run them 
+    # immediately inside the container without rebuilding the image.
+    volumes:
+      - ../:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      
+    # Connect to the same network so it can communicate with postgres-db
+    networks:
+      - backup_network
+      
+    # Pass configuration to our framework via environment variables.
+    # Notice how we use the service name 'postgres-db' as the host.
+    environment:
+      - TARGET_DB_HOST=postgres-db
+      - TARGET_DB_USER=admin
+      - TARGET_DB_PASSWORD=securepassword
+      - TARGET_DB_NAME=demo_db
+      
+    # Ensure the backup framework only starts after the database is fully ready
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+
+# Define the persistent volume
+volumes:
+  pgdata:
+
+# Define a shared bridge network for secure inter-container communication
+networks:
+  backup_network:
+    driver: bridge

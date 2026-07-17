@@ -1,0 +1,109 @@
+name: BackupForge CI/CD Pipeline
+
+# 1. Triggers
+on:
+  # Cron Schedule: Automate the backup to run every day at midnight (UTC)
+  schedule:
+    - cron: '0 0 * * *'
+  # Manual Trigger: Allow developers/admins to trigger a backup from the GitHub UI
+  workflow_dispatch:
+
+jobs:
+  # =========================================================
+  # JOB 1: CI Testing (Framework & Plugins)
+  # =========================================================
+  test-framework:
+    name: Run Automated Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Start Test Environment (Docker Compose)
+        run: |
+          # Spin up our local dev environment (PostgreSQL container + Engine container)
+          cd docker
+          docker-compose up -d --build
+          
+          # We must wait a few seconds for the Postgres daemon to initialize
+          echo "Waiting for database to initialize..."
+          sleep 10
+
+      - name: Test Backup Workflow
+        run: |
+          # Execute the backup script inside our running engine container
+          # This relies on the dummy database created by docker-compose
+          docker exec backupforge_engine bash /app/core/backup.sh
+
+      - name: Test Restore Workflow
+        run: |
+          # Locate the newly created backup file dynamically
+          BACKUP_FILE=$(docker exec backupforge_engine ls /app/backups/ | grep .gz | head -n 1)
+          echo "Testing restore on file: $BACKUP_FILE"
+          
+          # Execute the restore script with the backup file
+          # Our verification pipeline (Phase 6) will automatically test it!
+          docker exec backupforge_engine bash /app/core/restore.sh "/app/backups/$BACKUP_FILE"
+
+      - name: Verify Audit Logs
+        run: |
+          # Validate that our structured JSON logs were created successfully
+          cat logs/audit_success.json
+          if [ $(wc -l < logs/audit_success.json) -ne 2 ]; then
+             echo "Audit log validation failed. Expected 2 entries (backup + restore)."
+             exit 1
+          fi
+
+  # =========================================================
+  # JOB 2: Production Backup Execution
+  # =========================================================
+  execute-production-backup:
+    name: Execute Production Backup
+    needs: test-framework # Critical: Only run the production backup IF the tests passed!
+    runs-on: ubuntu-latest
+    
+    # Map GitHub Repository Secrets to Environment Variables
+    env:
+      DB_TYPE: postgres
+      TARGET_DB_HOST: ${{ secrets.PROD_DB_HOST }}
+      TARGET_DB_USER: ${{ secrets.PROD_DB_USER }}
+      TARGET_DB_PASSWORD: ${{ secrets.PROD_DB_PASSWORD }}
+      TARGET_DB_NAME: ${{ secrets.PROD_DB_NAME }}
+      UPLOAD_TO_S3: "true"
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build Backup Engine Container
+        run: cd docker && docker build -t backupforge-engine .
+
+      - name: Run Production Backup
+        run: |
+          # Spin up an ephemeral container specifically for this job.
+          # We pass all the GitHub Secrets into the container as environment variables.
+          docker run --rm \
+            -v ${{ github.workspace }}:/app \
+            -e DB_TYPE \
+            -e TARGET_DB_HOST \
+            -e TARGET_DB_USER \
+            -e TARGET_DB_PASSWORD \
+            -e TARGET_DB_NAME \
+            -e UPLOAD_TO_S3 \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e AWS_DEFAULT_REGION \
+            -e S3_BUCKET_NAME \
+            backupforge-engine bash /app/core/scheduler.sh
+
+      - name: Upload Logs as CI Artifact
+        uses: actions/upload-artifact@v4
+        if: always() # Ensure logs are uploaded even if the backup failed!
+        with:
+          name: backupforge-production-logs
+          path: logs/
+          retention-days: 14
